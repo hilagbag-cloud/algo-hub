@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check auth
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // User profile document
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Username reservation document
+    match /usernames/{username} {
+      allow read: if true;
+      allow write: if true;
+    }
+    
+    // Algorithms collection
+    match /algorithms/{algoId} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if isAuthenticated() && (resource.data.authorId == request.auth.uid);
+      
+      // Subcollection for ratings
+      match /ratings/{ratingId} {
+        allow read, write: if true;
+      }
+
+      // Subcollection for comments
+      match /comments/{commentId} {
+        allow read, create: if true;
+        allow update, delete: if isAuthenticated() && (resource.data.authorId == request.auth.uid);
+      }
+    }
+  }
+}

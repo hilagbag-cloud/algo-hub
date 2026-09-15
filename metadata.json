@@ -1,0 +1,6 @@
+{
+  "name": "AlgoBox Hub",
+  "description": "Communauté de partage, exécution en direct et notation d'algorithmes AlgoBox avec classement en temps réel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
