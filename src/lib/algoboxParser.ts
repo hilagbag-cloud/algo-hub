@@ -6,7 +6,74 @@ import {
 } from '../types/algobox';
 
 /**
- * Parses AlgoBox (.alg) files either in official XML format or plain-text representation.
+ * Interface representing an XML item node in AlgoBox XML format.
+ */
+interface XmlItemNode {
+  algoitem: string;
+  children: XmlItemNode[];
+}
+
+/**
+ * Simple, robust XML parser for AlgoBox (.alg) files that works in both
+ * browser and Node environments without requiring DOMParser.
+ */
+function parseAlgoXmlNodes(xmlText: string): { description: string; rootItems: XmlItemNode[] } {
+  // Extract description texte="..."
+  const descMatch = xmlText.match(/<description\s+[^>]*texte="([^"]*)"/i);
+  const description = descMatch ? decodeXmlEntities(descMatch[1]) : '';
+
+  // Parse <item algoitem="..."> tags and build element hierarchy
+  const rootItems: XmlItemNode[] = [];
+  const stack: XmlItemNode[] = [];
+
+  const itemRegex = /<item\s+algoitem="([^"]*)"(\s*\/)?\s*>|<\/item>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = itemRegex.exec(xmlText)) !== null) {
+    const isClosing = match[0].startsWith('</');
+    const isSelfClosing = Boolean(match[2]);
+    const algoitemRaw = match[1];
+
+    if (isClosing) {
+      if (stack.length > 0) {
+        stack.pop();
+      }
+    } else {
+      const decodedAlgoItem = decodeXmlEntities(algoitemRaw || '');
+      const node: XmlItemNode = {
+        algoitem: decodedAlgoItem,
+        children: [],
+      };
+
+      if (stack.length > 0) {
+        stack[stack.length - 1].children.push(node);
+      } else {
+        rootItems.push(node);
+      }
+
+      if (!isSelfClosing) {
+        stack.push(node);
+      }
+    }
+  }
+
+  return { description, rootItems };
+}
+
+/**
+ * Decodes standard XML entities.
+ */
+function decodeXmlEntities(str: string): string {
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Main entry point: Parses AlgoBox (.alg) content in official XML format or plain-text.
  */
 export function parseAlgoBox(content: string): ParsedAlgorithm {
   const trimmed = content.trim();
@@ -24,58 +91,37 @@ export function parseAlgoBox(content: string): ParsedAlgorithm {
   }
 }
 
-function decodeXmlEntities(str: string): string {
-  return str
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&');
-}
-
 function parseXmlAlgoBox(xmlText: string): ParsedAlgorithm {
-  const parser = new DOMParser();
-  const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
-  const parseError = xmlDoc.querySelector('parsererror');
-  if (parseError) {
-    throw new Error(parseError.textContent || 'XML invalide');
-  }
-
-  const descNode = xmlDoc.querySelector('description');
-  const description = descNode?.getAttribute('texte') || '';
-
+  const { description, rootItems } = parseAlgoXmlNodes(xmlText);
   const variables: VariableDecl[] = [];
   const errors: string[] = [];
   const rawLines: { line: number; text: string; indent: number }[] = [];
   let lineNumber = 1;
 
-  // Find VARIABLES section
-  const items = Array.from(xmlDoc.querySelectorAll('item'));
+  // Flatten all items to collect variables
+  const allItems: XmlItemNode[] = [];
+  function collectAll(nodes: XmlItemNode[]) {
+    for (const node of nodes) {
+      allItems.push(node);
+      collectAll(node.children);
+    }
+  }
+  collectAll(rootItems);
+
+  // Extract variables
   let inVariables = false;
-  let inAlgorithm = false;
-
-  // Let's gather variable declarations and algo items
-  const algoRootItems: Element[] = [];
-
-  for (const item of items) {
-    const algoItem = item.getAttribute('algoitem') || '';
-    const decoded = decodeXmlEntities(algoItem).trim();
-
-    if (decoded === 'VARIABLES') {
+  for (const item of allItems) {
+    const text = item.algoitem.trim();
+    if (text === 'VARIABLES') {
       inVariables = true;
-      inAlgorithm = false;
-      continue;
-    } else if (decoded === 'DEBUT_ALGORITHME') {
-      inVariables = false;
-      inAlgorithm = true;
-      continue;
-    } else if (decoded === 'FIN_ALGORITHME') {
-      inAlgorithm = false;
       continue;
     }
-
-    if (inVariables && decoded.includes('EST_DU_TYPE')) {
-      const match = decoded.match(/([a-zA-Z0-9_]+)\s+EST_DU_TYPE\s+(NOMBRE|CHAINE|LISTE)/i);
+    if (text === 'DEBUT_ALGORITHME') {
+      inVariables = false;
+      continue;
+    }
+    if (inVariables && text.includes('EST_DU_TYPE')) {
+      const match = text.match(/([a-zA-Z0-9_]+)\s+EST_DU_TYPE\s+(NOMBRE|CHAINE|LISTE)/i);
       if (match) {
         variables.push({
           name: match[1],
@@ -85,56 +131,103 @@ function parseXmlAlgoBox(xmlText: string): ParsedAlgorithm {
     }
   }
 
-  // Now extract the tree under DEBUT_ALGORITHME
-  // In AlgoBox XML, DEBUT_ALGORITHME can contain child <item> or be sibling items until FIN_ALGORITHME.
-  const debutAlgoItem = items.find((it) => (it.getAttribute('algoitem') || '').trim() === 'DEBUT_ALGORITHME');
+  // Find top-level algorithm nodes.
+  let algoNodesToParse: XmlItemNode[] = [];
 
-  let directChildNodes: Element[] = [];
-  if (debutAlgoItem && debutAlgoItem.children.length > 0) {
-    directChildNodes = Array.from(debutAlgoItem.children).filter((el) => el.tagName.toLowerCase() === 'item');
+  const debutNode = allItems.find((it) => it.algoitem.trim() === 'DEBUT_ALGORITHME');
+
+  if (debutNode && debutNode.children.length > 0) {
+    algoNodesToParse = debutNode.children;
   } else {
-    // Collect siblings between DEBUT_ALGORITHME and FIN_ALGORITHME
-    let started = false;
-    for (const it of items) {
-      const val = (it.getAttribute('algoitem') || '').trim();
-      if (val === 'DEBUT_ALGORITHME') {
-        started = true;
-        continue;
-      }
-      if (val === 'FIN_ALGORITHME') {
-        break;
-      }
-      if (started) {
-        // Only top-level items in algorithm
-        if (it.parentElement?.getAttribute('algoitem') === 'DEBUT_ALGORITHME' || it.parentElement?.tagName.toLowerCase() === 'algo') {
-          directChildNodes.push(it);
-        }
-      }
+    const debutIdx = rootItems.findIndex((it) => it.algoitem.trim() === 'DEBUT_ALGORITHME');
+    if (debutIdx !== -1) {
+      const finIdx = rootItems.findIndex((it, idx) => idx > debutIdx && it.algoitem.trim() === 'FIN_ALGORITHME');
+      const end = finIdx !== -1 ? finIdx : rootItems.length;
+      algoNodesToParse = rootItems.slice(debutIdx + 1, end);
     }
   }
 
-  // If directChildNodes is empty, grab all items after DEBUT_ALGORITHME that are commands
-  if (directChildNodes.length === 0) {
-    let collect = false;
-    for (const it of items) {
-      const val = (it.getAttribute('algoitem') || '').trim();
-      if (val === 'DEBUT_ALGORITHME') {
-        collect = true;
-        continue;
-      }
-      if (val === 'FIN_ALGORITHME') {
-        collect = false;
-        break;
-      }
-      if (collect && it.parentElement?.getAttribute('algoitem') !== 'VARIABLES') {
-        directChildNodes.push(it);
-      }
-    }
-  }
-
-  const commands = parseXmlItems(directChildNodes, 0, (text, indent) => {
+  function recordLine(text: string, indent: number) {
     rawLines.push({ line: lineNumber++, text, indent });
-  });
+  }
+
+  function parseXmlTreeNodes(nodes: XmlItemNode[], indent = 0): AlgoCommandNode[] {
+    const result: AlgoCommandNode[] = [];
+
+    for (const nodeItem of nodes) {
+      const text = nodeItem.algoitem.trim();
+      if (
+        !text ||
+        text === 'DEBUT_SI' ||
+        text === 'FIN_SI' ||
+        text === 'DEBUT_SINON' ||
+        text === 'FIN_SINON' ||
+        text === 'DEBUT_TANT_QUE' ||
+        text === 'FIN_TANT_QUE' ||
+        text === 'DEBUT_POUR' ||
+        text === 'FIN_POUR' ||
+        text === 'DEBUT_ALGORITHME' ||
+        text === 'FIN_ALGORITHME' ||
+        text === 'FONCTIONS_UTILISEES' ||
+        text === 'VARIABLES' ||
+        text.includes('EST_DU_TYPE')
+      ) {
+        continue;
+      }
+
+      const node = parseSingleCommand(text, lineNumber);
+
+      if (node.type === 'IF') {
+        recordLine(text, indent);
+        const children = nodeItem.children;
+        const thenXmlNodes: XmlItemNode[] = [];
+        const elseXmlNodes: XmlItemNode[] = [];
+        let inElseBranch = false;
+
+        for (const child of children) {
+          const childText = child.algoitem.trim();
+          if (childText === 'SINON') {
+            inElseBranch = true;
+            if (child.children.length > 0) {
+              elseXmlNodes.push(...child.children);
+            }
+            continue;
+          }
+
+          if (inElseBranch) {
+            elseXmlNodes.push(child);
+          } else {
+            thenXmlNodes.push(child);
+          }
+        }
+
+        node.thenBranch = parseXmlTreeNodes(thenXmlNodes, indent + 1);
+        if (elseXmlNodes.length > 0) {
+          recordLine('SINON', indent);
+          node.elseBranch = parseXmlTreeNodes(elseXmlNodes, indent + 1);
+        }
+        recordLine('FIN_SI', indent);
+        result.push(node);
+      } else if (node.type === 'WHILE') {
+        recordLine(text, indent);
+        node.body = parseXmlTreeNodes(nodeItem.children, indent + 1);
+        recordLine('FIN_TANT_QUE', indent);
+        result.push(node);
+      } else if (node.type === 'FOR') {
+        recordLine(text, indent);
+        node.body = parseXmlTreeNodes(nodeItem.children, indent + 1);
+        recordLine('FIN_POUR', indent);
+        result.push(node);
+      } else {
+        recordLine(text, indent);
+        result.push(node);
+      }
+    }
+
+    return result;
+  }
+
+  const commands = parseXmlTreeNodes(algoNodesToParse, 0);
 
   return {
     description,
@@ -143,172 +236,6 @@ function parseXmlAlgoBox(xmlText: string): ParsedAlgorithm {
     rawLines,
     errors,
   };
-}
-
-function parseXmlItems(
-  items: Element[],
-  currentLine: number,
-  recordLine: (text: string, indent: number) => void
-): AlgoCommandNode[] {
-  const nodes: AlgoCommandNode[] = [];
-  let i = 0;
-
-  while (i < items.length) {
-    const item = items[i];
-    const rawVal = item.getAttribute('algoitem') || '';
-    const text = decodeXmlEntities(rawVal).trim();
-
-    if (!text || text === 'DEBUT_SI' || text === 'FIN_SI' || text === 'DEBUT_SINON' || text === 'FIN_SINON' || text === 'DEBUT_TANT_QUE' || text === 'FIN_TANT_QUE' || text === 'DEBUT_POUR' || text === 'FIN_POUR') {
-      i++;
-      continue;
-    }
-
-    const node = parseSingleCommand(text, i + 1);
-
-    if (node.type === 'IF') {
-      // Check if item has child items or if they are following items
-      const childItems = Array.from(item.children).filter((c) => c.tagName.toLowerCase() === 'item');
-      if (childItems.length > 0) {
-        // XML nested hierarchy
-        recordLine(text, 0);
-        const thenItems: Element[] = [];
-        const elseItems: Element[] = [];
-        let inElse = false;
-
-        for (const child of childItems) {
-          const childText = decodeXmlEntities(child.getAttribute('algoitem') || '').trim();
-          if (childText === 'SINON') {
-            inElse = true;
-            continue;
-          }
-          if (inElse) {
-            elseItems.push(child);
-          } else {
-            thenItems.push(child);
-          }
-        }
-
-        node.thenBranch = parseXmlItems(thenItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        if (elseItems.length > 0) {
-          recordLine('SINON', 0);
-          node.elseBranch = parseXmlItems(elseItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        }
-        recordLine('FIN_SI', 0);
-      } else {
-        // Flat sibling structure
-        recordLine(text, 0);
-        const thenItems: Element[] = [];
-        const elseItems: Element[] = [];
-        let inElse = false;
-        let depth = 1;
-
-        i++;
-        while (i < items.length) {
-          const nextText = decodeXmlEntities(items[i].getAttribute('algoitem') || '').trim();
-          if (nextText.startsWith('SI ') && nextText.endsWith('ALORS')) {
-            depth++;
-          }
-          if (nextText === 'FIN_SI') {
-            depth--;
-            if (depth === 0) {
-              i++;
-              break;
-            }
-          }
-          if (depth === 1 && nextText === 'SINON') {
-            inElse = true;
-            i++;
-            continue;
-          }
-
-          if (inElse) {
-            elseItems.push(items[i]);
-          } else {
-            thenItems.push(items[i]);
-          }
-          i++;
-        }
-
-        node.thenBranch = parseXmlItems(thenItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        if (elseItems.length > 0) {
-          recordLine('SINON', 0);
-          node.elseBranch = parseXmlItems(elseItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        }
-        recordLine('FIN_SI', 0);
-        nodes.push(node);
-        continue;
-      }
-    } else if (node.type === 'WHILE') {
-      const childItems = Array.from(item.children).filter((c) => c.tagName.toLowerCase() === 'item');
-      if (childItems.length > 0) {
-        recordLine(text, 0);
-        node.body = parseXmlItems(childItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        recordLine('FIN_TANT_QUE', 0);
-      } else {
-        recordLine(text, 0);
-        const bodyItems: Element[] = [];
-        let depth = 1;
-        i++;
-        while (i < items.length) {
-          const nextText = decodeXmlEntities(items[i].getAttribute('algoitem') || '').trim();
-          if (nextText.startsWith('TANT_QUE ') && nextText.endsWith('FAIRE')) {
-            depth++;
-          }
-          if (nextText === 'FIN_TANT_QUE') {
-            depth--;
-            if (depth === 0) {
-              i++;
-              break;
-            }
-          }
-          bodyItems.push(items[i]);
-          i++;
-        }
-        node.body = parseXmlItems(bodyItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        recordLine('FIN_TANT_QUE', 0);
-        nodes.push(node);
-        continue;
-      }
-    } else if (node.type === 'FOR') {
-      const childItems = Array.from(item.children).filter((c) => c.tagName.toLowerCase() === 'item');
-      if (childItems.length > 0) {
-        recordLine(text, 0);
-        node.body = parseXmlItems(childItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        recordLine('FIN_POUR', 0);
-      } else {
-        recordLine(text, 0);
-        const bodyItems: Element[] = [];
-        let depth = 1;
-        i++;
-        while (i < items.length) {
-          const nextText = decodeXmlEntities(items[i].getAttribute('algoitem') || '').trim();
-          if (nextText.startsWith('POUR ') && nextText.endsWith('FAIRE')) {
-            depth++;
-          }
-          if (nextText === 'FIN_POUR') {
-            depth--;
-            if (depth === 0) {
-              i++;
-              break;
-            }
-          }
-          bodyItems.push(items[i]);
-          i++;
-        }
-        node.body = parseXmlItems(bodyItems, currentLine + 1, (t, ind) => recordLine(t, ind + 1));
-        recordLine('FIN_POUR', 0);
-        nodes.push(node);
-        continue;
-      }
-    } else {
-      recordLine(text, 0);
-    }
-
-    nodes.push(node);
-    i++;
-  }
-
-  return nodes;
 }
 
 function parseSingleCommand(lineText: string, line: number): AlgoCommandNode {
@@ -476,8 +403,24 @@ function parseTextAlgoBox(text: string, errors: string[]): ParsedAlgorithm {
     }
   }
 
+  const BLOCK_KEYWORDS = new Set([
+    'DEBUT_SI',
+    'FIN_SI',
+    'SINON',
+    'DEBUT_SINON',
+    'FIN_SINON',
+    'DEBUT_TANT_QUE',
+    'FIN_TANT_QUE',
+    'DEBUT_POUR',
+    'FIN_POUR',
+  ]);
+
   // Parse structured blocks in plain text
-  function parseBlock(startIndex: number, stopKeywords: string[]): { nodes: AlgoCommandNode[]; nextIndex: number } {
+  function parseBlock(
+    startIndex: number,
+    stopKeywords: string[],
+    currentIndent: number
+  ): { nodes: AlgoCommandNode[]; nextIndex: number } {
     const nodes: AlgoCommandNode[] = [];
     let idx = startIndex;
 
@@ -488,7 +431,7 @@ function parseTextAlgoBox(text: string, errors: string[]): ParsedAlgorithm {
         break;
       }
 
-      if (text === 'DEBUT_SI' || text === 'DEBUT_SINON' || text === 'DEBUT_TANT_QUE' || text === 'DEBUT_POUR') {
+      if (BLOCK_KEYWORDS.has(text)) {
         idx++;
         continue;
       }
@@ -496,53 +439,85 @@ function parseTextAlgoBox(text: string, errors: string[]): ParsedAlgorithm {
       const node = parseSingleCommand(text, origLine);
 
       if (node.type === 'IF') {
-        rawLines.push({ line: lineCounter++, text, indent: 0 });
+        rawLines.push({ line: lineCounter++, text, indent: currentIndent });
         idx++;
-        const thenRes = parseBlock(idx, ['SINON', 'FIN_SI']);
+
+        if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'DEBUT_SI') {
+          idx++;
+        }
+
+        const thenRes = parseBlock(idx, ['SINON', 'FIN_SI', 'DEBUT_SINON'], currentIndent + 1);
         node.thenBranch = thenRes.nodes;
         idx = thenRes.nextIndex;
 
-        if (idx < algoCodeLines.length && algoCodeLines[idx].text.startsWith('SINON')) {
-          rawLines.push({ line: lineCounter++, text: 'SINON', indent: 0 });
+        // Check if FIN_SI precedes SINON/DEBUT_SINON
+        if (
+          idx < algoCodeLines.length &&
+          algoCodeLines[idx].text === 'FIN_SI' &&
+          idx + 1 < algoCodeLines.length &&
+          (algoCodeLines[idx + 1].text === 'SINON' || algoCodeLines[idx + 1].text === 'DEBUT_SINON')
+        ) {
           idx++;
-          const elseRes = parseBlock(idx, ['FIN_SI']);
+        }
+
+        if (
+          idx < algoCodeLines.length &&
+          (algoCodeLines[idx].text === 'SINON' || algoCodeLines[idx].text === 'DEBUT_SINON')
+        ) {
+          if (algoCodeLines[idx].text === 'SINON') {
+            rawLines.push({ line: lineCounter++, text: 'SINON', indent: currentIndent });
+            idx++;
+          }
+          if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'DEBUT_SINON') {
+            idx++;
+          }
+          const elseRes = parseBlock(idx, ['FIN_SI', 'FIN_SINON'], currentIndent + 1);
           node.elseBranch = elseRes.nodes;
           idx = elseRes.nextIndex;
         }
 
-        if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'FIN_SI') {
-          rawLines.push({ line: lineCounter++, text: 'FIN_SI', indent: 0 });
+        if (
+          idx < algoCodeLines.length &&
+          (algoCodeLines[idx].text === 'FIN_SI' || algoCodeLines[idx].text === 'FIN_SINON')
+        ) {
+          rawLines.push({ line: lineCounter++, text: 'FIN_SI', indent: currentIndent });
           idx++;
         }
         nodes.push(node);
         continue;
       } else if (node.type === 'WHILE') {
-        rawLines.push({ line: lineCounter++, text, indent: 0 });
+        rawLines.push({ line: lineCounter++, text, indent: currentIndent });
         idx++;
-        const bodyRes = parseBlock(idx, ['FIN_TANT_QUE']);
+        if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'DEBUT_TANT_QUE') {
+          idx++;
+        }
+        const bodyRes = parseBlock(idx, ['FIN_TANT_QUE'], currentIndent + 1);
         node.body = bodyRes.nodes;
         idx = bodyRes.nextIndex;
         if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'FIN_TANT_QUE') {
-          rawLines.push({ line: lineCounter++, text: 'FIN_TANT_QUE', indent: 0 });
+          rawLines.push({ line: lineCounter++, text: 'FIN_TANT_QUE', indent: currentIndent });
           idx++;
         }
         nodes.push(node);
         continue;
       } else if (node.type === 'FOR') {
-        rawLines.push({ line: lineCounter++, text, indent: 0 });
+        rawLines.push({ line: lineCounter++, text, indent: currentIndent });
         idx++;
-        const bodyRes = parseBlock(idx, ['FIN_POUR']);
+        if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'DEBUT_POUR') {
+          idx++;
+        }
+        const bodyRes = parseBlock(idx, ['FIN_POUR'], currentIndent + 1);
         node.body = bodyRes.nodes;
         idx = bodyRes.nextIndex;
         if (idx < algoCodeLines.length && algoCodeLines[idx].text === 'FIN_POUR') {
-          rawLines.push({ line: lineCounter++, text: 'FIN_POUR', indent: 0 });
+          rawLines.push({ line: lineCounter++, text: 'FIN_POUR', indent: currentIndent });
           idx++;
         }
         nodes.push(node);
         continue;
       }
 
-      rawLines.push({ line: lineCounter++, text, indent: 0 });
+      rawLines.push({ line: lineCounter++, text, indent: currentIndent });
       nodes.push(node);
       idx++;
     }
@@ -550,7 +525,7 @@ function parseTextAlgoBox(text: string, errors: string[]): ParsedAlgorithm {
     return { nodes, nextIndex: idx };
   }
 
-  const { nodes: commands } = parseBlock(0, []);
+  const { nodes: commands } = parseBlock(0, [], 0);
 
   return {
     description: '',
